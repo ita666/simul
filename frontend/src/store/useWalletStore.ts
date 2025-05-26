@@ -1,13 +1,30 @@
 import { create } from "zustand";
+import { persist } from "zustand/middleware";
 
 type WalletState = {
   credits: number;
   addCredits: (amount: number) => void;
-  useCredit: () => void;
+  useCredits: (amount: number) => boolean;
+  hasEnoughCredits: (amount: number) => boolean;
 };
 
-export const useWalletStore = create<WalletState>((set) => ({
-  credits: 0,
-  addCredits: (amount) => set((state) => ({ credits: state.credits + amount })),
-  useCredit: () => set((state) => ({ credits: state.credits > 0 ? state.credits - 1 : 0 })),
-}));
+export const useWalletStore = create<WalletState>()(
+  persist(
+    (set, get) => ({
+      credits: 0,
+      addCredits: (amount) => set((state) => ({ credits: state.credits + amount })),
+      useCredits: (amount) => {
+        const currentCredits = get().credits;
+        if (currentCredits >= amount) {
+          set({ credits: currentCredits - amount });
+          return true;
+        }
+        return false;
+      },
+      hasEnoughCredits: (amount) => get().credits >= amount,
+    }),
+    {
+      name: "wallet-storage",
+    }
+  )
+);
