@@ -3,3 +3,9 @@ uvicorn
 pydantic
 stripe
 python-dotenv
+httpx
+beautifulsoup4
+sqlalchemy
+apscheduler
+alembic
+reportlab

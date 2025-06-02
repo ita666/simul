@@ -1,5 +1,6 @@
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import Optional, List, Dict
 import os
@@ -7,6 +8,19 @@ import stripe
 from dotenv import load_dotenv
 import math
 from datetime import datetime
+from sqlalchemy.orm import Session
+from database import get_db, BankRate
+from rate_fetcher import update_rates
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+import asyncio
+import json
+from reportlab.lib.pagesizes import letter, A4
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib import colors
+from reportlab.lib.units import inch
+import io
+import tempfile
 
 load_dotenv()
 
@@ -20,13 +34,36 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Initialize scheduler for automatic rate updates
+scheduler = AsyncIOScheduler()
+
+@app.on_event("startup")
+async def startup_event():
+    # Update rates on startup
+    asyncio.create_task(update_rates())
+    
+    # Schedule rate updates every 6 hours
+    scheduler.add_job(
+        update_rates,
+        'interval',
+        hours=6,
+        id='rate_update',
+        replace_existing=True
+    )
+    scheduler.start()
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    scheduler.shutdown()
+
 # Modèles de données
 class CalculateRequest(BaseModel):
     salaire: float
-    charges: float
-    taux: float = 0.03
+    autres_revenus: float = 0
+    charges: float = 0
+    taux: float = 3.5
     duree: int = 240
-    apport: Optional[float] = 0
+    taux_effort_max: float = 0.33
 
 class VariableRateRequest(BaseModel):
     salaire: float
@@ -53,20 +90,65 @@ class InvestmentRequest(BaseModel):
     charges_mensuelles: float
     impots_annuels: float
 
+class BankOffer(BaseModel):
+    bank_name: str
+    taux: float
+    duree: int
+    frais_dossier: float = 0
+    assurance_mensuelle: float = 0
+    taux_assurance: float = 0
+
+class MultiOfferRequest(BaseModel):
+    prix_bien: float
+    apport: float
+    offers: List[BankOffer]
+
+class ScenarioSaveRequest(BaseModel):
+    name: str
+    type: str  # basic, variable_rate, optimization, investment, stress_test
+    data: dict
+    results: dict
+
 @app.get("/")
 def read_root():
     return {"msg": "Bienvenue sur Simulpret API"}
 
 @app.post("/calculate")
 async def calculate(data: CalculateRequest):
-    mensualite_max = data.salaire * 0.33 - data.charges
-    if data.taux == 0: data.taux = 0.01
-    montant = mensualite_max * (1 - (1 + data.taux/12) ** -data.duree) / (data.taux/12)
+    # Calcul du revenu total
+    revenu_total = data.salaire + data.autres_revenus
+    
+    # Calcul de la mensualité maximale selon le taux d'effort
+    mensualite_max = (revenu_total * data.taux_effort_max) - data.charges
+    
+    # Protection contre mensualité négative
+    if mensualite_max <= 0:
+        return {
+            "montant": 0, 
+            "mensualite_max": 0,
+            "cout_total": 0,
+            "cout_credit": 0,
+            "revenu_total": round(revenu_total, 2),
+            "error": "Capacité d'emprunt insuffisante"
+        }
+    
+    # Calcul du montant empruntable
+    taux_mensuel = data.taux / 100 / 12
+    if taux_mensuel > 0:
+        montant = mensualite_max * (1 - (1 + taux_mensuel) ** -data.duree) / taux_mensuel
+    else:
+        montant = mensualite_max * data.duree
+    
+    cout_total = mensualite_max * data.duree
+    cout_credit = cout_total - montant
+    
     return {
         "montant": round(montant, 2), 
         "mensualite_max": round(mensualite_max, 2),
-        "cout_total": round(mensualite_max * data.duree, 2),
-        "cout_credit": round(mensualite_max * data.duree - montant, 2)
+        "cout_total": round(cout_total, 2),
+        "cout_credit": round(cout_credit, 2),
+        "revenu_total": round(revenu_total, 2),
+        "taux_effort_utilise": data.taux_effort_max
     }
 
 @app.post("/calculate/variable-rate")
@@ -289,4 +371,332 @@ async def get_pricing():
             "pro": {"credits": 10, "price": 3.50, "price_per_credit": 0.35},
             "premium": {"credits": 30, "price": 9.00, "price_per_credit": 0.30}
         }
+    }
+
+@app.get("/bank-rates")
+async def get_bank_rates(db: Session = Depends(get_db)):
+    """Obtenir les taux actuels des principales banques depuis la base de données"""
+    
+    # Get rates from database
+    rates = db.query(BankRate).all()
+    
+    if not rates:
+        # If no rates in DB, trigger an update
+        asyncio.create_task(update_rates())
+        
+        # Return default rates for now
+        return {
+            "rates": [
+                {
+                    "bank_name": "Crédit Agricole",
+                    "rate_10_years": 3.20,
+                    "rate_15_years": 3.45,
+                    "rate_20_years": 3.65,
+                    "rate_25_years": 3.85,
+                    "best_rate": True,
+                    "last_updated": datetime.now().strftime("%Y-%m-%d")
+                }
+            ],
+            "average_rates": {
+                "10_years": 3.25,
+                "15_years": 3.50,
+                "20_years": 3.70,
+                "25_years": 3.89
+            },
+            "last_update": datetime.now().strftime("%Y-%m-%d"),
+            "status": "updating"
+        }
+    
+    # Convert to response format
+    rate_list = []
+    for rate in rates:
+        rate_list.append({
+            "bank_name": rate.bank_name,
+            "rate_10_years": rate.rate_10_years,
+            "rate_15_years": rate.rate_15_years,
+            "rate_20_years": rate.rate_20_years,
+            "rate_25_years": rate.rate_25_years,
+            "best_rate": False,  # Will be calculated
+            "last_updated": rate.last_updated.strftime("%Y-%m-%d %H:%M")
+        })
+    
+    # Sort by average rate and mark best rates
+    for duration in ['10', '15', '20', '25']:
+        sorted_rates = sorted(rate_list, key=lambda x: x[f'rate_{duration}_years'])
+        if sorted_rates:
+            sorted_rates[0]['best_rate'] = True
+    
+    # Calculate averages
+    avg_10 = sum(r['rate_10_years'] for r in rate_list) / len(rate_list) if rate_list else 0
+    avg_15 = sum(r['rate_15_years'] for r in rate_list) / len(rate_list) if rate_list else 0
+    avg_20 = sum(r['rate_20_years'] for r in rate_list) / len(rate_list) if rate_list else 0
+    avg_25 = sum(r['rate_25_years'] for r in rate_list) / len(rate_list) if rate_list else 0
+    
+    # Get most recent update time
+    last_update = max(r.last_updated for r in rates) if rates else datetime.now()
+    
+    return {
+        "rates": rate_list,
+        "average_rates": {
+            "10_years": round(avg_10, 2),
+            "15_years": round(avg_15, 2),
+            "20_years": round(avg_20, 2),
+            "25_years": round(avg_25, 2)
+        },
+        "last_update": last_update.strftime("%Y-%m-%d %H:%M"),
+        "next_update": "In 6 hours"
+    }
+
+@app.post("/bank-rates/update")
+async def force_rate_update():
+    """Force an immediate update of bank rates"""
+    asyncio.create_task(update_rates())
+    return {"status": "Update started", "message": "Rates will be updated in the background"}
+
+@app.post("/calculate/multi-offer")
+async def compare_offers(data: MultiOfferRequest):
+    """Comparaison multi-offres - Coût: 2 crédits"""
+    montant_emprunte = data.prix_bien - data.apport
+    
+    comparisons = []
+    
+    for offer in data.offers:
+        taux_mensuel = offer.taux / 100 / 12
+        
+        # Calcul mensualité hors assurance
+        if taux_mensuel > 0:
+            mensualite_credit = montant_emprunte * taux_mensuel / (1 - (1 + taux_mensuel) ** -offer.duree)
+        else:
+            mensualite_credit = montant_emprunte / offer.duree
+        
+        # Calcul assurance
+        if offer.taux_assurance > 0:
+            assurance_mensuelle = montant_emprunte * (offer.taux_assurance / 100) / 12
+        else:
+            assurance_mensuelle = offer.assurance_mensuelle
+        
+        mensualite_totale = mensualite_credit + assurance_mensuelle
+        
+        # Coût total
+        cout_total = (mensualite_totale * offer.duree) + offer.frais_dossier
+        cout_credit = cout_total - montant_emprunte
+        
+        comparisons.append({
+            "bank_name": offer.bank_name,
+            "mensualite_credit": round(mensualite_credit, 2),
+            "assurance_mensuelle": round(assurance_mensuelle, 2),
+            "mensualite_totale": round(mensualite_totale, 2),
+            "frais_dossier": offer.frais_dossier,
+            "cout_total": round(cout_total, 2),
+            "cout_credit": round(cout_credit, 2),
+            "taux": offer.taux,
+            "duree": offer.duree
+        })
+    
+    # Trier par coût total
+    comparisons.sort(key=lambda x: x["cout_total"])
+    
+    # Calculer les économies par rapport à l'offre la plus chère
+    if len(comparisons) > 1:
+        max_cout = max(c["cout_total"] for c in comparisons)
+        for comp in comparisons:
+            comp["economie"] = round(max_cout - comp["cout_total"], 2)
+    
+    return {
+        "montant_emprunte": round(montant_emprunte, 2),
+        "comparisons": comparisons,
+        "meilleure_offre": comparisons[0] if comparisons else None,
+        "credits_required": 2
+    }
+
+@app.post("/export/pdf")
+async def export_pdf(data: dict):
+    """Export PDF du rapport - Coût: 1 crédit"""
+    try:
+        # Créer un fichier temporaire
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
+            # Créer le document PDF
+            doc = SimpleDocTemplate(tmp_file.name, pagesize=A4)
+            story = []
+            
+            # Styles
+            styles = getSampleStyleSheet()
+            title_style = ParagraphStyle(
+                'CustomTitle',
+                parent=styles['Title'],
+                fontSize=24,
+                textColor=colors.HexColor('#1a1a1a'),
+                spaceAfter=30,
+            )
+            
+            # Titre
+            story.append(Paragraph("Rapport de Simulation Immobilière", title_style))
+            story.append(Spacer(1, 20))
+            
+            # Informations générales
+            info_data = [
+                ["Type de simulation", data.get("type", "Standard")],
+                ["Date", datetime.now().strftime("%d/%m/%Y")],
+                ["Montant du bien", f"{data.get('prix_bien', 0):,.0f} €"],
+                ["Apport", f"{data.get('apport', 0):,.0f} €"],
+                ["Montant emprunté", f"{data.get('montant_emprunte', 0):,.0f} €"]
+            ]
+            
+            info_table = Table(info_data, colWidths=[200, 200])
+            info_table.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, -1), colors.lightgrey),
+                ('TEXTCOLOR', (0, 0), (-1, -1), colors.black),
+                ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+                ('FONTNAME', (0, 0), (-1, -1), 'Helvetica'),
+                ('FONTSIZE', (0, 0), (-1, -1), 12),
+                ('GRID', (0, 0), (-1, -1), 1, colors.white),
+                ('ROWBACKGROUNDS', (0, 0), (-1, -1), [colors.lightgrey, colors.white]),
+                ('PADDING', (0, 0), (-1, -1), 10),
+            ]))
+            
+            story.append(info_table)
+            story.append(Spacer(1, 30))
+            
+            # Résultats selon le type
+            if data.get("type") == "multi_offer" and "comparisons" in data:
+                story.append(Paragraph("Comparaison des Offres", styles['Heading2']))
+                story.append(Spacer(1, 10))
+                
+                # Tableau des offres
+                offer_data = [["Banque", "Taux", "Durée", "Mensualité", "Coût total", "Économie"]]
+                
+                for offer in data["comparisons"]:
+                    offer_data.append([
+                        offer["bank_name"],
+                        f"{offer['taux']}%",
+                        f"{offer['duree']} mois",
+                        f"{offer['mensualite_totale']:,.0f} €",
+                        f"{offer['cout_total']:,.0f} €",
+                        f"{offer.get('economie', 0):,.0f} €"
+                    ])
+                
+                offer_table = Table(offer_data, colWidths=[100, 60, 60, 80, 80, 80])
+                offer_table.setStyle(TableStyle([
+                    ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+                    ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                    ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                    ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                    ('FONTSIZE', (0, 0), (-1, -1), 10),
+                    ('GRID', (0, 0), (-1, -1), 1, colors.black),
+                    ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.lightgrey]),
+                ]))
+                
+                story.append(offer_table)
+            
+            elif data.get("type") == "optimization" and "alternatives" in data:
+                story.append(Paragraph("Optimisation Apport/Durée", styles['Heading2']))
+                story.append(Spacer(1, 10))
+                
+                opt_data = [["Apport", "Durée", "Mensualité", "Coût total", "Taux d'effort"]]
+                
+                for alt in data["alternatives"][:5]:
+                    opt_data.append([
+                        f"{alt['apport']:,.0f} € ({alt['apport_pct']}%)",
+                        f"{alt['duree']} mois",
+                        f"{alt['mensualite']:,.0f} €",
+                        f"{alt['cout_total']:,.0f} €",
+                        f"{alt['taux_effort']}%"
+                    ])
+                
+                opt_table = Table(opt_data, colWidths=[120, 80, 80, 100, 80])
+                opt_table.setStyle(TableStyle([
+                    ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+                    ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                    ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                    ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                    ('FONTSIZE', (0, 0), (-1, -1), 10),
+                    ('GRID', (0, 0), (-1, -1), 1, colors.black),
+                    ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.lightgrey]),
+                ]))
+                
+                story.append(opt_table)
+            
+            # Générer le PDF
+            doc.build(story)
+            
+            # Retourner le fichier
+            return FileResponse(
+                tmp_file.name,
+                media_type='application/pdf',
+                filename=f"simulation_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+            )
+            
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erreur lors de la génération du PDF: {str(e)}")
+
+@app.post("/export/csv")
+async def export_csv(data: dict):
+    """Export CSV des données - Gratuit"""
+    try:
+        import csv
+        import tempfile
+        
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.csv', newline='') as tmp_file:
+            writer = csv.writer(tmp_file)
+            
+            # En-têtes généraux
+            writer.writerow(["Simulation Immobilière - Export CSV"])
+            writer.writerow(["Date", datetime.now().strftime("%d/%m/%Y %H:%M")])
+            writer.writerow([])
+            
+            # Données selon le type
+            if data.get("type") == "multi_offer" and "comparisons" in data:
+                writer.writerow(["Comparaison Multi-Offres"])
+                writer.writerow(["Banque", "Taux (%)", "Durée (mois)", "Mensualité (€)", "Coût total (€)"])
+                
+                for offer in data["comparisons"]:
+                    writer.writerow([
+                        offer["bank_name"],
+                        offer["taux"],
+                        offer["duree"],
+                        offer["mensualite_totale"],
+                        offer["cout_total"]
+                    ])
+            
+            elif data.get("type") == "basic":
+                writer.writerow(["Simulation Basique"])
+                writer.writerow(["Paramètre", "Valeur"])
+                writer.writerow(["Montant emprunté", data.get("montant", 0)])
+                writer.writerow(["Mensualité", data.get("mensualite_max", 0)])
+                writer.writerow(["Coût total", data.get("cout_total", 0)])
+                writer.writerow(["Coût du crédit", data.get("cout_credit", 0)])
+            
+            tmp_file.flush()
+            
+            return FileResponse(
+                tmp_file.name,
+                media_type='text/csv',
+                filename=f"simulation_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+            )
+            
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erreur lors de la génération du CSV: {str(e)}")
+
+@app.post("/scenarios/save")
+async def save_scenario(data: ScenarioSaveRequest):
+    """Sauvegarder un scénario (stockage côté client)"""
+    # Dans une vraie app, on sauvegarderait en DB
+    # Ici on retourne juste un ID unique pour le localStorage
+    scenario_id = f"scenario_{datetime.now().timestamp()}"
+    
+    return {
+        "id": scenario_id,
+        "name": data.name,
+        "type": data.type,
+        "created_at": datetime.now().isoformat(),
+        "message": "Scénario prêt à être sauvegardé dans le navigateur"
+    }
+
+@app.get("/scenarios/list")
+async def list_scenarios():
+    """Liste des scénarios (pour future implémentation avec auth)"""
+    # Placeholder pour future implémentation avec authentification
+    return {
+        "scenarios": [],
+        "message": "Les scénarios sont stockés localement dans votre navigateur"
     }

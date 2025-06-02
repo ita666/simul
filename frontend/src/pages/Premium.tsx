@@ -3,11 +3,11 @@ import { useWalletStore } from "../store/useWalletStore";
 
 export default function Premium() {
   const { t } = useTranslation();
-  const { credits, useCredit } = useWalletStore();
+  const { credits, useCredits } = useWalletStore();
 
   function handlePremiumFeature() {
     if (credits > 0) {
-      useCredit();
+      useCredits(1);
       alert(t("creditUsed"));
     } else {
       alert(t("notEnoughCredits"));

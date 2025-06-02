@@ -180,16 +180,50 @@ export default function VariableRate() {
                 </tr>
               </thead>
               <tbody>
-                {result.projections.map((proj: any) => (
-                  <tr key={proj.annee} className="border-b">
-                    <td className="py-2">{proj.annee}</td>
-                    <td className="py-2">{proj.taux}%</td>
-                    <td className="py-2">{proj.mensualite.toLocaleString()} €</td>
+                {result.projections.map((proj: any, index: number) => (
+                  <tr key={proj.annee} className="border-b hover:bg-gray-50">
+                    <td className="py-2">Année {proj.annee}</td>
+                    <td className="py-2">
+                      <span className={`font-medium ${
+                        index === 0 ? 'text-green-600' : 
+                        proj.taux > formData.taux_initial ? 'text-red-600' : 'text-gray-900'
+                      }`}>
+                        {proj.taux}%
+                      </span>
+                    </td>
+                    <td className="py-2">
+                      <span className={`font-medium ${
+                        proj.mensualite > result.mensualite_initiale ? 'text-red-600' : 'text-gray-900'
+                      }`}>
+                        {proj.mensualite.toLocaleString()} €
+                      </span>
+                      {proj.mensualite > result.mensualite_initiale && (
+                        <span className="text-xs text-red-600 ml-2">
+                          (+{((proj.mensualite - result.mensualite_initiale) / result.mensualite_initiale * 100).toFixed(1)}%)
+                        </span>
+                      )}
+                    </td>
                     <td className="py-2">{proj.capital_restant.toLocaleString()} €</td>
                   </tr>
                 ))}
               </tbody>
             </table>
+          </div>
+          
+          {/* Summary statistics */}
+          <div className="mt-6 p-4 bg-blue-50 rounded-lg">
+            <h4 className="font-semibold mb-2">Résumé de l'impact</h4>
+            <p className="text-sm text-blue-800">
+              Sur la durée du prêt, votre mensualité pourrait varier de 
+              <strong> {result.mensualite_initiale.toLocaleString()} €</strong> à 
+              <strong> {Math.max(...result.projections.map(p => p.mensualite)).toLocaleString()} €</strong>
+              {result.projections.length > 0 && (
+                <span>
+                  , soit une augmentation maximale de 
+                  <strong> {((Math.max(...result.projections.map(p => p.mensualite)) - result.mensualite_initiale) / result.mensualite_initiale * 100).toFixed(1)}%</strong>.
+                </span>
+              )}
+            </p>
           </div>
         </div>
       )}

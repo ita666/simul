@@ -31,13 +31,10 @@ export default function App() {
   }, [t]);
 
   const navLinks = [
-    { path: "/", label: t("home") },
-    { path: "/variable-rate", label: t("variableRate") },
-    { path: "/optimization", label: t("optimization") },
-    { path: "/investment", label: t("investment") },
-    { path: "/stress-test", label: t("stressTest") },
-    { path: "/compare", label: t("compare") },
-    { path: "/premium", label: t("premium") },
+    { path: "/", label: "Calculateur" },
+    { path: "/compare", label: "Comparateur de taux" },
+    { path: "/optimization", label: "Optimisation" },
+    { path: "/premium", label: "Premium" },
   ];
 
   return (
